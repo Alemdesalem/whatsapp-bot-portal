@@ -205,12 +205,20 @@ async def buscar_conteudo_wp(query: str) -> str:
     return resultado
 
 async def enviar_status_digitando(numero: str):
+    """Marca presença como online e digitando via WhatsApp API"""
     url = f"https://graph.facebook.com/v22.0/{PHONE_NUMBER_ID}/messages"
     headers = {"Authorization": f"Bearer {WHATSAPP_TOKEN}", "Content-Type": "application/json"}
-    payload = {"messaging_product": "whatsapp", "to": numero, "type": "reaction", "status": "typing"}
+    # Marca como online
+    payload_online = {
+        "messaging_product": "whatsapp",
+        "to": numero,
+        "recipient_type": "individual",
+        "type": "contacts",
+        "status": "read"
+    }
     try:
         async with httpx.AsyncClient() as c:
-            await c.post(url, headers=headers, json=payload)
+            await c.post(url, headers=headers, json=payload_online)
     except Exception:
         pass
 
@@ -221,6 +229,50 @@ async def enviar_mensagem_whatsapp(numero: str, mensagem: str):
     payload = {"messaging_product": "whatsapp", "to": numero, "type": "text", "text": {"body": mensagem}}
     async with httpx.AsyncClient() as client_http:
         await client_http.post(url, headers=headers, json=payload)
+
+
+def dividir_mensagem(texto: str) -> list:
+    """Divide mensagem longa em partes naturais para simular digitação humana"""
+    # Se for curta, manda de uma vez
+    if len(texto) < 300:
+        return [texto]
+
+    partes = []
+    paragrafos = texto.split("
+
+")
+    parte_atual = ""
+
+    for paragrafo in paragrafos:
+        if not paragrafo.strip():
+            continue
+        # Se adicionar esse parágrafo passar de 400 chars, fecha a parte atual
+        if len(parte_atual) + len(paragrafo) > 400 and parte_atual:
+            partes.append(parte_atual.strip())
+            parte_atual = paragrafo
+        else:
+            parte_atual += "
+
+" + paragrafo if parte_atual else paragrafo
+
+    if parte_atual.strip():
+        partes.append(parte_atual.strip())
+
+    # Limita a 4 partes
+    return partes[:4] if partes else [texto]
+
+
+async def enviar_mensagem_picada(numero: str, mensagem: str):
+    """Envia mensagem dividida em partes com delay para simular digitação humana"""
+    partes = dividir_mensagem(mensagem)
+
+    for i, parte in enumerate(partes):
+        # Delay proporcional ao tamanho da parte (simula digitação)
+        delay = min(len(parte) * 0.02, 3.0)  # máximo 3 segundos
+        if i > 0:
+            await asyncio.sleep(delay)
+
+        await enviar_mensagem_whatsapp(numero, parte)
 
 
 # ============================================================
@@ -277,7 +329,7 @@ async def transcrever_audio(audio_bytes: bytes) -> str:
 
 async def processar_mensagem(numero: str, mensagem: str) -> str:
     if "HUMANO" in mensagem.upper():
-        return "💜 Entendido! Vou chamar nossa equipe agora. Em breve alguém da Além de Salém entrará em contato com você. Que a luz guie esse encontro! ✨"
+        return "💜 Entendido! Vou chamar nossa equipe agora.\n\nEm breve alguém da Além de Salém entrará em contato com você.\n\nQue a luz guie esse encontro! ✨"
 
     memoria = await buscar_memoria_cliente(numero)
     query_busca = await extrair_keywords_com_ia(mensagem)
@@ -355,7 +407,7 @@ async def receber_mensagem(request: Request):
             texto = message.get("text", {}).get("body", "")
             await enviar_status_digitando(numero)
             resposta = await processar_mensagem(numero, texto)
-            await enviar_mensagem_whatsapp(numero, resposta)
+            await enviar_mensagem_picada(numero, resposta)
 
         elif tipo == "audio":
             media_id = message.get("audio", {}).get("id", "")
@@ -365,9 +417,9 @@ async def receber_mensagem(request: Request):
             if texto_transcrito:
                 print(f"Audio transcrito: {texto_transcrito}")
                 resposta = await processar_mensagem(numero, texto_transcrito)
-                await enviar_mensagem_whatsapp(numero, f"🎙️ Entendi: _{texto_transcrito}_\n\n{resposta}")
+                await enviar_mensagem_picada(numero, f"🎙️ Entendi: _{texto_transcrito}_\n\n{resposta}")
             else:
-                await enviar_mensagem_whatsapp(numero, "💜 Não consegui entender o áudio. Pode digitar sua mensagem?")
+                await enviar_mensagem_picada(numero, "💜 Não consegui entender o áudio. Pode digitar sua mensagem?")
 
         return {"status": "ok"}
 
