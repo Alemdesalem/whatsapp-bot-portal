@@ -65,6 +65,11 @@ MUITO IMPORTANTE — Filosofia da loja:
 - Faça perguntas para entender melhor: "Prefere óleo, erva, vela ou banho?" "É para atrair ou fixar?" "Quer algo mais suave ou mais intenso?"
 - Baseie suas respostas SEMPRE nos produtos reais do contexto fornecido
 
+Regras sobre o nome do cliente:
+- Se o contexto indicar [CLIENTE NOVO] (sem nome registrado), SEMPRE pergunte o nome do cliente de forma natural na sua primeira resposta, ex: "Antes de começar, como posso te chamar? 💜"
+- Se já souber o nome do cliente, USE O NOME naturalmente nas respostas (ex: "Oi, Alex! 🔮")
+- Sempre chame pelo nome quando possível — isso cria conexão
+
 Regras de resposta:
 - SEPARE sua resposta em parágrafos curtos (2-3 frases cada) usando quebra de linha dupla entre eles
 - Cada parágrafo deve ser uma ideia completa: saudação, recomendação, instrução de uso, link, etc.
@@ -85,12 +90,15 @@ Contexto:
 # ============================================================
 
 
-async def marcar_lida(message_id: str):
-    """Marca a mensagem do cliente como lida (double blue check)"""
+async def marcar_lida_e_digitando(message_id: str):
+    """Marca mensagem como lida (blue checks) + mostra 'digitando...' ao mesmo tempo"""
     payload = {
         "messaging_product": "whatsapp",
         "status": "read",
         "message_id": message_id,
+        "typing_indicator": {
+            "type": "text",
+        },
     }
     try:
         await http_client.post(
@@ -100,25 +108,19 @@ async def marcar_lida(message_id: str):
         pass
 
 
-async def enviar_presenca(numero: str, presenca: str = "composing"):
-    """Envia status de presença: 'composing' (digitando) ou 'available'"""
+async def enviar_digitando(message_id: str):
+    """Mostra indicador 'digitando...' no WhatsApp do cliente"""
     payload = {
         "messaging_product": "whatsapp",
-        "recipient_type": "individual",
-        "to": numero,
-        "type": "reaction",
-    }
-    # A API correta de presença usa o endpoint de presença
-    presence_url = f"https://graph.facebook.com/v22.0/{PHONE_NUMBER_ID}/messages"
-    presence_payload = {
-        "messaging_product": "whatsapp",
-        "recipient_type": "individual",
-        "to": numero,
-        "status": presenca,
+        "status": "read",
+        "message_id": message_id,
+        "typing_indicator": {
+            "type": "text",
+        },
     }
     try:
         await http_client.post(
-            presence_url, headers=WHATSAPP_HEADERS, json=presence_payload
+            WHATSAPP_API_URL, headers=WHATSAPP_HEADERS, json=payload
         )
     except Exception:
         pass
@@ -186,7 +188,7 @@ def dividir_mensagem(texto: str, max_partes: int = 4) -> list[str]:
     return partes if partes else [texto]
 
 
-async def enviar_mensagem_picada(numero: str, mensagem: str):
+async def enviar_mensagem_picada(numero: str, mensagem: str, message_id: str):
     """
     Envia mensagem dividida em partes com indicador de 'digitando'
     entre cada parte para simular conversa humana natural.
@@ -196,15 +198,12 @@ async def enviar_mensagem_picada(numero: str, mensagem: str):
     for i, parte in enumerate(partes):
         if i > 0:
             # Mostra "digitando..." antes de cada parte subsequente
-            await enviar_presenca(numero, "composing")
+            await enviar_digitando(message_id)
             # Delay proporcional ao tamanho (simula leitura e digitação)
             delay = max(1.0, min(len(parte) * 0.015, 3.0))
             await asyncio.sleep(delay)
 
         await enviar_mensagem_whatsapp(numero, parte)
-
-    # Volta ao status "disponível" após enviar tudo
-    await enviar_presenca(numero, "available")
 
 
 # ============================================================
@@ -434,19 +433,23 @@ async def processar_mensagem(numero: str, mensagem: str) -> str:
 
     # Monta contexto do cliente
     contexto_cliente = ""
+    nome = memoria.get("nome", "") if memoria else ""
     if memoria:
-        nome = memoria.get("nome", "")
         historico = memoria.get("historico_resumido", "")
         produtos = memoria.get("produtos_interesse", [])
         total = memoria.get("total_conversas", 0)
         if nome:
             contexto_cliente += f"Nome do cliente: {nome}\n"
+        else:
+            contexto_cliente += "[CLIENTE NOVO] — ainda não sabemos o nome. Pergunte!\n"
         if historico:
             contexto_cliente += f"Histórico: {historico}\n"
         if produtos:
             contexto_cliente += f"Já se interessou por: {', '.join(produtos)}\n"
         if total > 0:
             contexto_cliente += f"Essa é a {total + 1}ª conversa com esse cliente.\n"
+    else:
+        contexto_cliente += "[CLIENTE NOVO] — primeira conversa, ainda não sabemos o nome. Pergunte!\n"
 
     mensagem_com_contexto = mensagem
     if contexto_cliente:
@@ -506,15 +509,12 @@ async def receber_mensagem(request: Request):
         message_id = message.get("id")
 
         # Marca como lida + mostra "digitando" imediatamente
-        await asyncio.gather(
-            marcar_lida(message_id),
-            enviar_presenca(numero, "composing"),
-        )
+        await marcar_lida_e_digitando(message_id)
 
         if tipo == "text":
             texto = message.get("text", {}).get("body", "")
             resposta = await processar_mensagem(numero, texto)
-            await enviar_mensagem_picada(numero, resposta)
+            await enviar_mensagem_picada(numero, resposta, message_id)
 
         elif tipo == "audio":
             media_id = message.get("audio", {}).get("id", "")
@@ -523,15 +523,8 @@ async def receber_mensagem(request: Request):
 
             if texto_transcrito:
                 print(f"Áudio transcrito: {texto_transcrito}")
-                # Envia confirmação da transcrição primeiro
-                await enviar_mensagem_whatsapp(
-                    numero, f"🎙️ Entendi: _{texto_transcrito}_"
-                )
-                await enviar_presenca(numero, "composing")
-                await asyncio.sleep(1.0)
-
                 resposta = await processar_mensagem(numero, texto_transcrito)
-                await enviar_mensagem_picada(numero, resposta)
+                await enviar_mensagem_picada(numero, resposta, message_id)
             else:
                 await enviar_mensagem_whatsapp(
                     numero,
