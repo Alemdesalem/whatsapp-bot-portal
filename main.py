@@ -7,6 +7,7 @@ from fastapi.responses import PlainTextResponse
 import anthropic
 from supabase import create_client, Client
 from indexar import buscar_produtos_indexados, buscar_posts_indexados, indexar_produtos, indexar_posts
+import openai
 
 app = FastAPI()
 
@@ -226,6 +227,54 @@ async def enviar_mensagem_whatsapp(numero: str, mensagem: str):
 # PROCESSAMENTO PRINCIPAL
 # ============================================================
 
+
+
+async def baixar_audio_whatsapp(media_id: str) -> bytes:
+    """Baixa arquivo de áudio do WhatsApp"""
+    # Primeiro pega a URL do arquivo
+    url_info = f"https://graph.facebook.com/v22.0/{media_id}"
+    headers = {"Authorization": f"Bearer {WHATSAPP_TOKEN}"}
+    
+    async with httpx.AsyncClient() as c:
+        r = await c.get(url_info, headers=headers)
+        media_url = r.json().get("url")
+        
+        # Baixa o arquivo
+        r2 = await c.get(media_url, headers=headers)
+        return r2.content
+
+
+async def transcrever_audio(audio_bytes: bytes) -> str:
+    """Transcreve áudio usando OpenAI Whisper"""
+    try:
+        openai_key = os.environ.get("OPENAI_API_KEY")
+        if not openai_key:
+            return ""
+        
+        client_oai = openai.OpenAI(api_key=openai_key)
+        
+        # Salva temporariamente
+        import tempfile
+        with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as f:
+            f.write(audio_bytes)
+            temp_path = f.name
+        
+        # Transcreve
+        with open(temp_path, "rb") as f:
+            transcript = client_oai.audio.transcriptions.create(
+                model="whisper-1",
+                file=f,
+                language="pt"
+            )
+        
+        import os as os_module
+        os_module.unlink(temp_path)
+        
+        return transcript.text
+    except Exception as e:
+        print(f"Erro ao transcrever audio: {e}")
+        return ""
+
 async def processar_mensagem(numero: str, mensagem: str) -> str:
     if "HUMANO" in mensagem.upper():
         return "💜 Entendido! Vou chamar nossa equipe agora. Em breve alguém da Além de Salém entrará em contato com você. Que a luz guie esse encontro! ✨"
@@ -307,6 +356,18 @@ async def receber_mensagem(request: Request):
             await enviar_status_digitando(numero)
             resposta = await processar_mensagem(numero, texto)
             await enviar_mensagem_whatsapp(numero, resposta)
+
+        elif tipo == "audio":
+            media_id = message.get("audio", {}).get("id", "")
+            await enviar_status_digitando(numero)
+            audio_bytes = await baixar_audio_whatsapp(media_id)
+            texto_transcrito = await transcrever_audio(audio_bytes)
+            if texto_transcrito:
+                print(f"Audio transcrito: {texto_transcrito}")
+                resposta = await processar_mensagem(numero, texto_transcrito)
+                await enviar_mensagem_whatsapp(numero, f"🎙️ Entendi: _{texto_transcrito}_\n\n{resposta}")
+            else:
+                await enviar_mensagem_whatsapp(numero, "💜 Não consegui entender o áudio. Pode digitar sua mensagem?")
 
         return {"status": "ok"}
 
