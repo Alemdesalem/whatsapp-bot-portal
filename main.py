@@ -1,24 +1,26 @@
 import os
 import json
 import httpx
+import asyncio
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import PlainTextResponse
 import anthropic
+from supabase import create_client, Client
 
 app = FastAPI()
 
-# Configurações via variáveis de ambiente
+# Configurações
 VERIFY_TOKEN = os.environ.get("VERIFY_TOKEN", "agnes_verify_token")
 WHATSAPP_TOKEN = os.environ.get("WHATSAPP_TOKEN")
 PHONE_NUMBER_ID = os.environ.get("PHONE_NUMBER_ID")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
 WP_URL = os.environ.get("WP_URL", "https://www.alemdesalem.com.br")
+SUPABASE_URL = os.environ.get("SUPABASE_URL")
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
 
-# Histórico de conversas em memória (por número)
-conversation_history = {}
-
-# Cliente Anthropic
+# Clientes
 client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 SYSTEM_PROMPT = """Você é Agnes, a assistente espiritual e consultora da loja Além de Salém.
 
@@ -40,7 +42,8 @@ Regras importantes:
 - Se perguntarem algo fora do tema, redirecione gentilmente
 - Mensagens curtas e objetivas — máximo 3 parágrafos por resposta
 - Use emojis com moderação: 🔮 💜 ✨ 🌙
-- Nunca invente preços — diga para verificar no site: https://www.alemdesalem.com.br
+- Nunca invente preços — use sempre os dados reais dos produtos fornecidos no contexto
+- Se o cliente já comprou ou perguntou sobre algo antes, mencione isso naturalmente
 
 Contexto do portal e loja:
 - Site: https://www.alemdesalem.com.br
@@ -48,17 +51,124 @@ Contexto do portal e loja:
 - Portal de notícias sobre espiritualidade, astrologia, tarot e autoconhecimento"""
 
 
+# ============================================================
+# MEMÓRIA DE CLIENTES
+# ============================================================
+
+async def buscar_memoria_cliente(numero: str) -> dict:
+    try:
+        result = supabase.table("memoria_clientes").select("*").eq("numero_whatsapp", numero).execute()
+        if result.data:
+            return result.data[0]
+    except Exception as e:
+        print(f"Erro ao buscar memória: {e}")
+    return {}
+
+
+async def salvar_conversa(numero: str, mensagem: str, resposta: str, keywords: str):
+    try:
+        supabase.table("conversas").insert({
+            "numero_whatsapp": numero,
+            "mensagem_cliente": mensagem,
+            "resposta_agnes": resposta,
+            "keywords": keywords
+        }).execute()
+    except Exception as e:
+        print(f"Erro ao salvar conversa: {e}")
+
+
+async def atualizar_memoria_cliente(numero: str, mensagem: str, resposta: str, keywords: str):
+    try:
+        memoria = await buscar_memoria_cliente(numero)
+        historico_atual = memoria.get("historico_resumido", "")
+        produtos_interesse = memoria.get("produtos_interesse", [])
+
+        resumo_response = client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=300,
+            messages=[{
+                "role": "user",
+                "content": f"""Analise essa conversa e retorne um JSON com:
+- "resumo": 1 frase resumindo o interesse do cliente (máx 100 chars)
+- "produto": produto ou tema que o cliente perguntou (ou null)
+- "nome": nome do cliente se mencionou (ou null)
+
+Histórico anterior: {historico_atual}
+Cliente disse: {mensagem}
+Agnes respondeu: {resposta}
+
+Retorne APENAS o JSON, sem explicação."""
+            }]
+        )
+
+        texto = resumo_response.content[0].text.strip()
+        texto = texto.replace("```json", "").replace("```", "").strip()
+        dados = json.loads(texto)
+
+        novo_resumo = dados.get("resumo", historico_atual)
+        novo_produto = dados.get("produto")
+        novo_nome = dados.get("nome")
+
+        if novo_produto and novo_produto not in produtos_interesse:
+            produtos_interesse.append(novo_produto)
+            produtos_interesse = produtos_interesse[-10:]
+
+        update_data = {
+            "numero_whatsapp": numero,
+            "historico_resumido": novo_resumo,
+            "produtos_interesse": produtos_interesse,
+            "updated_at": "NOW()"
+        }
+
+        if novo_nome:
+            update_data["nome"] = novo_nome
+
+        if memoria:
+            update_data["total_conversas"] = memoria.get("total_conversas", 0) + 1
+            supabase.table("memoria_clientes").update(update_data).eq("numero_whatsapp", numero).execute()
+        else:
+            update_data["total_conversas"] = 1
+            supabase.table("memoria_clientes").insert(update_data).execute()
+
+    except Exception as e:
+        print(f"Erro ao atualizar memória: {e}")
+
+
+# ============================================================
+# BUSCA DE CONTEÚDO
+# ============================================================
+
+async def extrair_keywords_com_ia(mensagem: str) -> str:
+    try:
+        response = client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=50,
+            messages=[{
+                "role": "user",
+                "content": f"""Extraia apenas as palavras-chave de produto ou tema espiritual desta mensagem para buscar em uma loja esotérica.
+Corrija erros de digitação. Retorne APENAS as keywords, sem explicação, máximo 3 palavras.
+Exemplos:
+- "quero comprar mandragora" → "mandrágora"
+- "tem cristal de quartzo?" → "cristal quartzo"
+- "incenso pra proteçao" → "incenso proteção"
+
+Mensagem: {mensagem}
+Keywords:"""
+            }]
+        )
+        keywords = response.content[0].text.strip()
+        return keywords if keywords else mensagem
+    except Exception:
+        return mensagem
+
+
 async def buscar_conteudo_wp(query: str) -> str:
-    """Busca notícias e produtos relevantes no WordPress + WooCommerce"""
     resultado = ""
-    
     wc_key = os.environ.get("WC_CONSUMER_KEY")
     wc_secret = os.environ.get("WC_CONSUMER_SECRET")
 
     try:
         async with httpx.AsyncClient(timeout=10) as client_http:
-
-            # Busca produtos no WooCommerce
             if wc_key and wc_secret:
                 produtos_url = f"{WP_URL}/wp-json/wc/v3/products?search={query}&per_page=4&status=publish"
                 r = await client_http.get(produtos_url, auth=(wc_key, wc_secret))
@@ -79,7 +189,6 @@ async def buscar_conteudo_wp(query: str) -> str:
                 else:
                     print(f"Erro WooCommerce: {r.text[:200]}")
 
-            # Busca posts/notícias do portal
             posts_url = f"{WP_URL}/wp-json/wp/v2/posts?search={query}&per_page=3&_fields=title,excerpt,link"
             r2 = await client_http.get(posts_url)
             if r2.status_code == 200:
@@ -97,139 +206,117 @@ async def buscar_conteudo_wp(query: str) -> str:
     return resultado
 
 
-async def enviar_mensagem_whatsapp(numero: str, mensagem: str):
-    """Envia mensagem via API do WhatsApp"""
+# ============================================================
+# WHATSAPP
+# ============================================================
+
+async def enviar_status_digitando(numero: str):
     url = f"https://graph.facebook.com/v22.0/{PHONE_NUMBER_ID}/messages"
-    headers = {
-        "Authorization": f"Bearer {WHATSAPP_TOKEN}",
-        "Content-Type": "application/json"
-    }
-    payload = {
-        "messaging_product": "whatsapp",
-        "to": numero,
-        "type": "text",
-        "text": {"body": mensagem}
-    }
+    headers = {"Authorization": f"Bearer {WHATSAPP_TOKEN}", "Content-Type": "application/json"}
+    payload = {"messaging_product": "whatsapp", "to": numero, "type": "reaction", "status": "typing"}
+    try:
+        async with httpx.AsyncClient() as c:
+            await c.post(url, headers=headers, json=payload)
+    except Exception:
+        pass
+
+
+async def enviar_mensagem_whatsapp(numero: str, mensagem: str):
+    url = f"https://graph.facebook.com/v22.0/{PHONE_NUMBER_ID}/messages"
+    headers = {"Authorization": f"Bearer {WHATSAPP_TOKEN}", "Content-Type": "application/json"}
+    payload = {"messaging_product": "whatsapp", "to": numero, "type": "text", "text": {"body": mensagem}}
     async with httpx.AsyncClient() as client_http:
         await client_http.post(url, headers=headers, json=payload)
 
 
-async def extrair_keywords_com_ia(mensagem: str) -> str:
-    """Usa Claude para extrair keywords de busca da mensagem, corrigindo erros de digitação"""
-    try:
-        response = client.messages.create(
-            model="claude-haiku-4-5-20251001",
-            max_tokens=50,
-            messages=[{
-                "role": "user",
-                "content": f"""Extraia apenas as palavras-chave de produto ou tema espiritual desta mensagem para buscar em uma loja esotérica.
-Corrija erros de digitação. Retorne APENAS as keywords, sem explicação, máximo 3 palavras.
-Exemplos:
-- "quero comprar mandragora" → "mandrágora"
-- "tem cristal de quartzo?" → "cristal quartzo"
-- "incenso pra proteçao" → "incenso proteção"
-- "mandragorra raiz" → "mandrágora raiz"
-
-Mensagem: {mensagem}
-Keywords:"""
-            }]
-        )
-        keywords = response.content[0].text.strip()
-        return keywords if keywords else mensagem
-    except Exception:
-        return mensagem
-
+# ============================================================
+# PROCESSAMENTO PRINCIPAL
+# ============================================================
 
 async def processar_mensagem(numero: str, mensagem: str) -> str:
-    """Processa mensagem com Claude + contexto do WP"""
-    
-    # Verifica se quer falar com humano
     if "HUMANO" in mensagem.upper():
         return "💜 Entendido! Vou chamar nossa equipe agora. Em breve alguém da Além de Salém entrará em contato com você. Que a luz guie esse encontro! ✨"
-    
-    # Claude extrai keywords da mensagem (trata erros de digitação também)
+
+    memoria = await buscar_memoria_cliente(numero)
     query_busca = await extrair_keywords_com_ia(mensagem)
     print(f"Keywords extraidas pela IA: {query_busca}")
-
-    # Busca conteudo relevante no WordPress
     contexto_wp = await buscar_conteudo_wp(query_busca)
-    
-    # Monta histórico da conversa
-    if numero not in conversation_history:
-        conversation_history[numero] = []
-    
-    # Adiciona contexto do WP à mensagem se houver
+
+    contexto_cliente = ""
+    if memoria:
+        nome = memoria.get("nome", "")
+        historico = memoria.get("historico_resumido", "")
+        produtos = memoria.get("produtos_interesse", [])
+        total = memoria.get("total_conversas", 0)
+        if nome:
+            contexto_cliente += f"Nome do cliente: {nome}\n"
+        if historico:
+            contexto_cliente += f"Histórico: {historico}\n"
+        if produtos:
+            contexto_cliente += f"Já se interessou por: {', '.join(produtos)}\n"
+        if total > 0:
+            contexto_cliente += f"Essa é a {total + 1}ª conversa com esse cliente.\n"
+
     mensagem_com_contexto = mensagem
+    if contexto_cliente:
+        mensagem_com_contexto += f"\n\n[Memória do cliente]:\n{contexto_cliente}"
     if contexto_wp:
-        mensagem_com_contexto = f"{mensagem}\n\n[Contexto do portal]:\n{contexto_wp}"
-    
-    conversation_history[numero].append({
-        "role": "user",
-        "content": mensagem_com_contexto
-    })
-    
-    # Mantém apenas as últimas 10 mensagens para não estourar o contexto
-    if len(conversation_history[numero]) > 10:
-        conversation_history[numero] = conversation_history[numero][-10:]
-    
-    # Chama Claude
+        mensagem_com_contexto += f"\n\n[Produtos e conteúdos encontrados]:\n{contexto_wp}"
+
     response = client.messages.create(
         model="claude-sonnet-4-5",
         max_tokens=1000,
         system=SYSTEM_PROMPT,
-        messages=conversation_history[numero]
+        messages=[{"role": "user", "content": mensagem_com_contexto}]
     )
-    
+
     resposta = response.content[0].text
-    
-    # Salva resposta no histórico
-    conversation_history[numero].append({
-        "role": "assistant",
-        "content": resposta
-    })
-    
+
+    asyncio.create_task(salvar_conversa(numero, mensagem, resposta, query_busca))
+    asyncio.create_task(atualizar_memoria_cliente(numero, mensagem, resposta, query_busca))
+
     return resposta
 
 
+# ============================================================
+# ENDPOINTS
+# ============================================================
+
 @app.get("/webhook")
 async def verificar_webhook(request: Request):
-    """Verificação do webhook pela Meta"""
     params = dict(request.query_params)
     mode = params.get("hub.mode")
     token = params.get("hub.verify_token")
     challenge = params.get("hub.challenge")
-    
     if mode == "subscribe" and token == VERIFY_TOKEN:
         return PlainTextResponse(challenge)
-    
     raise HTTPException(status_code=403, detail="Token inválido")
 
 
 @app.post("/webhook")
 async def receber_mensagem(request: Request):
-    """Recebe mensagens do WhatsApp"""
     try:
         body = await request.json()
-        
         entry = body.get("entry", [{}])[0]
         changes = entry.get("changes", [{}])[0]
         value = changes.get("value", {})
         messages = value.get("messages", [])
-        
+
         if not messages:
             return {"status": "ok"}
-        
+
         message = messages[0]
         numero = message.get("from")
         tipo = message.get("type")
-        
+
         if tipo == "text":
             texto = message.get("text", {}).get("body", "")
+            await enviar_status_digitando(numero)
             resposta = await processar_mensagem(numero, texto)
             await enviar_mensagem_whatsapp(numero, resposta)
-        
+
         return {"status": "ok"}
-    
+
     except Exception as e:
         print(f"Erro: {e}")
         return {"status": "ok"}
@@ -238,3 +325,27 @@ async def receber_mensagem(request: Request):
 @app.get("/")
 async def health_check():
     return {"status": "Agnes está online 🔮", "portal": WP_URL}
+
+
+@app.get("/insights")
+async def ver_insights():
+    try:
+        conversas = supabase.table("conversas").select("*", count="exact").execute()
+        clientes = supabase.table("memoria_clientes").select("*", count="exact").execute()
+        top_keywords = supabase.table("conversas").select("keywords").execute()
+
+        keywords_count = {}
+        for row in top_keywords.data:
+            kw = row.get("keywords", "")
+            if kw:
+                keywords_count[kw] = keywords_count.get(kw, 0) + 1
+
+        top = sorted(keywords_count.items(), key=lambda x: x[1], reverse=True)[:10]
+
+        return {
+            "total_conversas": conversas.count,
+            "total_clientes": clientes.count,
+            "top_interesses": top
+        }
+    except Exception as e:
+        return {"erro": str(e)}
