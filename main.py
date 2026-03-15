@@ -114,6 +114,32 @@ async def enviar_mensagem_whatsapp(numero: str, mensagem: str):
         await client_http.post(url, headers=headers, json=payload)
 
 
+async def extrair_keywords_com_ia(mensagem: str) -> str:
+    """Usa Claude para extrair keywords de busca da mensagem, corrigindo erros de digitação"""
+    try:
+        response = client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=50,
+            messages=[{
+                "role": "user",
+                "content": f"""Extraia apenas as palavras-chave de produto ou tema espiritual desta mensagem para buscar em uma loja esotérica.
+Corrija erros de digitação. Retorne APENAS as keywords, sem explicação, máximo 3 palavras.
+Exemplos:
+- "quero comprar mandragora" → "mandrágora"
+- "tem cristal de quartzo?" → "cristal quartzo"
+- "incenso pra proteçao" → "incenso proteção"
+- "mandragorra raiz" → "mandrágora raiz"
+
+Mensagem: {mensagem}
+Keywords:"""
+            }]
+        )
+        keywords = response.content[0].text.strip()
+        return keywords if keywords else mensagem
+    except Exception:
+        return mensagem
+
+
 async def processar_mensagem(numero: str, mensagem: str) -> str:
     """Processa mensagem com Claude + contexto do WP"""
     
@@ -121,8 +147,12 @@ async def processar_mensagem(numero: str, mensagem: str) -> str:
     if "HUMANO" in mensagem.upper():
         return "💜 Entendido! Vou chamar nossa equipe agora. Em breve alguém da Além de Salém entrará em contato com você. Que a luz guie esse encontro! ✨"
     
-    # Busca conteúdo relevante no WordPress
-    contexto_wp = await buscar_conteudo_wp(mensagem)
+    # Claude extrai keywords da mensagem (trata erros de digitação também)
+    query_busca = await extrair_keywords_com_ia(mensagem)
+    print(f"Keywords extraidas pela IA: {query_busca}")
+
+    # Busca conteudo relevante no WordPress
+    contexto_wp = await buscar_conteudo_wp(query_busca)
     
     # Monta histórico da conversa
     if numero not in conversation_history:
