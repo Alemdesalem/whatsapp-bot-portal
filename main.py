@@ -232,35 +232,28 @@ async def enviar_mensagem_whatsapp(numero: str, mensagem: str):
 
 
 def dividir_mensagem(texto: str) -> list:
-    """Divide mensagem longa em partes naturais para simular digitação humana"""
-    # Se for curta, manda de uma vez
+    """Divide mensagem longa em partes naturais"""
     if len(texto) < 300:
         return [texto]
 
+    separador = "\n\n"
+    paragrafos = texto.split(separador)
     partes = []
-    paragrafos = texto.split("
-
-")
     parte_atual = ""
 
     for paragrafo in paragrafos:
         if not paragrafo.strip():
             continue
-        # Se adicionar esse parágrafo passar de 400 chars, fecha a parte atual
         if len(parte_atual) + len(paragrafo) > 400 and parte_atual:
             partes.append(parte_atual.strip())
             parte_atual = paragrafo
         else:
-            parte_atual += "
-
-" + paragrafo if parte_atual else paragrafo
+            parte_atual = (parte_atual + separador + paragrafo) if parte_atual else paragrafo
 
     if parte_atual.strip():
         partes.append(parte_atual.strip())
 
-    # Limita a 4 partes
     return partes[:4] if partes else [texto]
-
 
 async def enviar_mensagem_picada(numero: str, mensagem: str):
     """Envia mensagem dividida em partes com delay para simular digitação humana"""
