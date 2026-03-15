@@ -6,6 +6,7 @@ from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import PlainTextResponse
 import anthropic
 from supabase import create_client, Client
+from indexar import buscar_produtos_indexados, buscar_posts_indexados, indexar_produtos, indexar_posts
 
 app = FastAPI()
 
@@ -171,52 +172,36 @@ Keywords:"""
 
 
 async def buscar_conteudo_wp(query: str) -> str:
+    """Busca no banco indexado — rapido e economico"""
     resultado = ""
-    wc_key = os.environ.get("WC_CONSUMER_KEY")
-    wc_secret = os.environ.get("WC_CONSUMER_SECRET")
 
     try:
-        async with httpx.AsyncClient(timeout=10) as client_http:
-            if wc_key and wc_secret:
-                produtos_url = f"{WP_URL}/wp-json/wc/v3/products?search={query}&per_page=4&status=publish"
-                r = await client_http.get(produtos_url, auth=(wc_key, wc_secret))
-                print(f"WooCommerce status: {r.status_code} | query: {query}")
-                if r.status_code == 200:
-                    produtos = r.json()
-                    print(f"Produtos encontrados: {len(produtos)}")
-                    if produtos:
-                        resultado += "🛍️ Produtos encontrados na loja:\n"
-                        for p in produtos:
-                            nome = p.get("name", "")
-                            preco = p.get("price", "")
-                            link = p.get("permalink", "")
-                            stock_status = p.get("stock_status", "instock")
-                            estoque = "✅ Em estoque" if stock_status == "instock" else "⚠️ Sob consulta"
-                            resultado += f"• *{nome}* — R$ {preco} | {estoque}\n  {link}\n"
-                        resultado += "\n"
-                else:
-                    print(f"Erro WooCommerce: {r.text[:200]}")
+        produtos = await buscar_produtos_indexados(query)
+        print(f"Produtos no banco: {len(produtos)} | query: {query}")
 
-            posts_url = f"{WP_URL}/wp-json/wp/v2/posts?search={query}&per_page=3&_fields=title,excerpt,link"
-            r2 = await client_http.get(posts_url)
-            if r2.status_code == 200:
-                posts = r2.json()
-                if posts:
-                    resultado += "📰 Conteúdos do portal:\n"
-                    for post in posts:
-                        titulo = post.get("title", {}).get("rendered", "")
-                        link = post.get("link", "")
-                        resultado += f"• {titulo}\n  {link}\n"
+        if produtos:
+            resultado += "Produtos encontrados na loja:\n"
+            for p in produtos:
+                nome = p.get("nome", "")
+                preco = p.get("preco", "")
+                link = p.get("link", "")
+                estoque = "Em estoque" if p.get("estoque") == "Em estoque" else "Sob consulta"
+                descricao = p.get("descricao", "")[:200]
+                resultado += f"- {nome} R$ {preco} | {estoque}\n  {descricao}\n  {link}\n"
+            resultado += "\n"
+
+        posts = await buscar_posts_indexados(query)
+        if posts:
+            resultado += "Conteudos do portal:\n"
+            for post in posts:
+                titulo = post.get("titulo", "")
+                link = post.get("link", "")
+                resultado += f"- {titulo}\n  {link}\n"
 
     except Exception as e:
-        print(f"Erro ao buscar conteúdo: {e}")
+        print(f"Erro ao buscar conteudo indexado: {e}")
 
     return resultado
-
-
-# ============================================================
-# WHATSAPP
-# ============================================================
 
 async def enviar_status_digitando(numero: str):
     url = f"https://graph.facebook.com/v22.0/{PHONE_NUMBER_ID}/messages"
@@ -357,3 +342,35 @@ async def ver_insights():
         }
     except Exception as e:
         return {"erro": str(e)}
+
+@app.get("/indexar")
+async def trigger_indexar():
+    """Endpoint para rodar indexação manualmente ou via cron"""
+    try:
+        total_produtos = await indexar_produtos()
+        total_posts = await indexar_posts()
+        return {
+            "status": "ok",
+            "produtos_indexados": total_produtos,
+            "posts_indexados": total_posts
+        }
+    except Exception as e:
+        return {"status": "erro", "detalhe": str(e)}
+
+
+@app.on_event("startup")
+async def startup_event():
+    """Roda indexação inicial ao subir o servidor"""
+    import asyncio
+    print("Agnes iniciando... verificando banco de dados")
+    try:
+        result = supabase.table("produtos_indexados").select("id", count="exact").execute()
+        total = result.count or 0
+        if total == 0:
+            print("Banco vazio — iniciando indexacao completa...")
+            asyncio.create_task(indexar_produtos())
+            asyncio.create_task(indexar_posts())
+        else:
+            print(f"Banco ja tem {total} produtos indexados")
+    except Exception as e:
+        print(f"Erro no startup: {e}")
