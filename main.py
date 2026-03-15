@@ -62,17 +62,22 @@ async def buscar_conteudo_wp(query: str) -> str:
             if wc_key and wc_secret:
                 produtos_url = f"{WP_URL}/wp-json/wc/v3/products?search={query}&per_page=4&status=publish"
                 r = await client_http.get(produtos_url, auth=(wc_key, wc_secret))
+                print(f"WooCommerce status: {r.status_code} | query: {query}")
                 if r.status_code == 200:
                     produtos = r.json()
+                    print(f"Produtos encontrados: {len(produtos)}")
                     if produtos:
                         resultado += "🛍️ Produtos encontrados na loja:\n"
                         for p in produtos:
                             nome = p.get("name", "")
                             preco = p.get("price", "")
                             link = p.get("permalink", "")
-                            estoque = "✅ Em estoque" if p.get("in_stock", False) else "⚠️ Sob consulta"
+                            stock_status = p.get("stock_status", "instock")
+                            estoque = "✅ Em estoque" if stock_status == "instock" else "⚠️ Sob consulta"
                             resultado += f"• *{nome}* — R$ {preco} | {estoque}\n  {link}\n"
                         resultado += "\n"
+                else:
+                    print(f"Erro WooCommerce: {r.text[:200]}")
 
             # Busca posts/notícias do portal
             posts_url = f"{WP_URL}/wp-json/wp/v2/posts?search={query}&per_page=3&_fields=title,excerpt,link"
