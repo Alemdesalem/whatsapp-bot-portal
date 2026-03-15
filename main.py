@@ -49,25 +49,47 @@ Contexto do portal e loja:
 
 
 async def buscar_conteudo_wp(query: str) -> str:
-    """Busca notícias e produtos relevantes no WordPress"""
+    """Busca notícias e produtos relevantes no WordPress + WooCommerce"""
+    resultado = ""
+    
+    wc_key = os.environ.get("WC_CONSUMER_KEY")
+    wc_secret = os.environ.get("WC_CONSUMER_SECRET")
+
     try:
         async with httpx.AsyncClient(timeout=10) as client_http:
-            # Busca posts
+
+            # Busca produtos no WooCommerce
+            if wc_key and wc_secret:
+                produtos_url = f"{WP_URL}/wp-json/wc/v3/products?search={query}&per_page=4&status=publish"
+                r = await client_http.get(produtos_url, auth=(wc_key, wc_secret))
+                if r.status_code == 200:
+                    produtos = r.json()
+                    if produtos:
+                        resultado += "🛍️ Produtos encontrados na loja:\n"
+                        for p in produtos:
+                            nome = p.get("name", "")
+                            preco = p.get("price", "")
+                            link = p.get("permalink", "")
+                            estoque = "✅ Em estoque" if p.get("in_stock", False) else "⚠️ Sob consulta"
+                            resultado += f"• *{nome}* — R$ {preco} | {estoque}\n  {link}\n"
+                        resultado += "\n"
+
+            # Busca posts/notícias do portal
             posts_url = f"{WP_URL}/wp-json/wp/v2/posts?search={query}&per_page=3&_fields=title,excerpt,link"
-            response = await client_http.get(posts_url)
-            
-            if response.status_code == 200:
-                posts = response.json()
+            r2 = await client_http.get(posts_url)
+            if r2.status_code == 200:
+                posts = r2.json()
                 if posts:
-                    resultado = "📰 Conteúdos relacionados do portal:\n"
+                    resultado += "📰 Conteúdos do portal:\n"
                     for post in posts:
                         titulo = post.get("title", {}).get("rendered", "")
                         link = post.get("link", "")
                         resultado += f"• {titulo}\n  {link}\n"
-                    return resultado
-    except Exception:
-        pass
-    return ""
+
+    except Exception as e:
+        print(f"Erro ao buscar conteúdo: {e}")
+
+    return resultado
 
 
 async def enviar_mensagem_whatsapp(numero: str, mensagem: str):
